@@ -1,5 +1,6 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Analytics } from '@vercel/analytics/react';
 import Header from './components/Header';
 import GameMap from './components/GameMap';
 import TriviaPanel from './components/TriviaPanel';
@@ -328,6 +329,7 @@ const App: React.FC = () => {
 
   return (
     <div className="h-screen w-screen flex flex-col bg-[#0f0a05] overflow-hidden text-white">
+      <Analytics />
       {gameState.phase === 'AUTH' ? (
         <Auth onLogin={handleLogin} />
       ) : gameState.phase === 'LOBBY' ? (
