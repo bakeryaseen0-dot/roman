@@ -6,14 +6,15 @@ interface TriviaPanelProps {
   question: TriviaQuestion;
   onAnswer: (correct: boolean) => void;
   timer: number;
+  disabled?: boolean;
 }
 
-const TriviaPanel: React.FC<TriviaPanelProps> = ({ question, onAnswer, timer }) => {
+const TriviaPanel: React.FC<TriviaPanelProps> = ({ question, onAnswer, timer, disabled = false }) => {
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
   const [isAnswered, setIsAnswered] = useState(false);
 
   const handleOptionClick = (idx: number) => {
-    if (isAnswered) return;
+    if (isAnswered || disabled) return;
     setSelectedIdx(idx);
     setIsAnswered(true);
     setTimeout(() => {
@@ -34,11 +35,14 @@ const TriviaPanel: React.FC<TriviaPanelProps> = ({ question, onAnswer, timer }) 
           <h2 className="text-3xl font-bold text-[#2d1a01] arabic-font leading-relaxed">
             {question.question}
           </h2>
+          {disabled && (
+            <p className="text-red-600 font-bold mt-2 animate-pulse">خصمك يقوم بالإجابة حالياً...</p>
+          )}
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {question.options.map((opt, idx) => {
-            let bgColor = 'bg-[#f8edeb] hover:bg-[#fae1dd] text-[#2d1a01]';
+            let bgColor = disabled ? 'bg-gray-200 text-gray-500' : 'bg-[#f8edeb] hover:bg-[#fae1dd] text-[#2d1a01]';
             let borderColor = 'border-[#8b4513]';
 
             if (isAnswered) {
@@ -56,9 +60,9 @@ const TriviaPanel: React.FC<TriviaPanelProps> = ({ question, onAnswer, timer }) 
             return (
               <button
                 key={idx}
-                disabled={isAnswered}
+                disabled={isAnswered || disabled}
                 onClick={() => handleOptionClick(idx)}
-                className={`p-4 text-xl font-semibold rounded-xl border-b-4 transition-all duration-200 transform hover:scale-[1.02] active:scale-95 ${bgColor} ${borderColor}`}
+                className={`p-4 text-xl font-semibold rounded-xl border-b-4 transition-all duration-200 transform ${!disabled ? 'hover:scale-[1.02] active:scale-95' : ''} ${bgColor} ${borderColor}`}
               >
                 {opt}
               </button>

@@ -5,19 +5,29 @@ export enum PlayerId {
   BOT_2 = 'BOT_2'
 }
 
+export interface UserAccount {
+  username: string;
+  avatar: string;
+  totalScore: number;
+  level: number;
+  wins: number;
+  gamesPlayed: number;
+}
+
 export interface Player {
-  id: PlayerId;
+  id: string; // Dynamic ID from PeerJS
   name: string;
   color: string;
   score: number;
   avatar: string;
   level: number;
+  isHost: boolean;
 }
 
 export interface Territory {
   id: string;
   name: string;
-  ownerId: PlayerId | null;
+  ownerId: string | null;
   points: number;
   path: string;
 }
@@ -37,12 +47,21 @@ export interface ChatMessage {
   timestamp: Date;
 }
 
+export type GamePhase = 'AUTH' | 'LOBBY' | 'ROOM_WAITING' | 'INITIAL_LANDING' | 'BATTLE' | 'GAME_OVER';
+
 export interface GameState {
-  players: Record<PlayerId, Player>;
+  players: Player[];
   territories: Territory[];
-  currentPlayerId: PlayerId;
-  phase: 'LOBBY' | 'MATCHMAKING' | 'INITIAL_LANDING' | 'BATTLE' | 'GAME_OVER';
+  currentPlayerIndex: number;
+  phase: GamePhase;
   round: number;
   selectedTerritoryId: string | null;
   chat: ChatMessage[];
+  roomCode: string | null;
 }
+
+export type PeerMessage = 
+  | { type: 'STATE_UPDATE'; state: GameState }
+  | { type: 'CHAT'; message: ChatMessage }
+  | { type: 'START_GAME' }
+  | { type: 'QUESTION_TRIGGER'; question: TriviaQuestion };

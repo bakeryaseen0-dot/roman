@@ -4,7 +4,8 @@ import { Territory, PlayerId, Player } from '../types';
 
 interface GameMapProps {
   territories: Territory[];
-  players: Record<PlayerId, Player>;
+  // Use Record<string, Player> for dynamic peer IDs instead of strict Record<PlayerId, Player>
+  players: Record<string, Player>;
   onTerritoryClick: (territoryId: string) => void;
   selectedTerritoryId: string | null;
   phase: string;

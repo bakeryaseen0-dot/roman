@@ -1,7 +1,7 @@
 
 import { PlayerId, Territory, Player } from './types';
 
-// Added missing 'level' property to each player definition to match Player interface requirements
+// Fixed missing 'isHost' property and updated BOT enum references
 export const INITIAL_PLAYERS: Record<PlayerId, Player> = {
   [PlayerId.USER]: {
     id: PlayerId.USER,
@@ -9,7 +9,8 @@ export const INITIAL_PLAYERS: Record<PlayerId, Player> = {
     color: '#dc2626', // Red
     score: 0,
     avatar: 'https://picsum.photos/seed/warrior/100/100',
-    level: 1
+    level: 1,
+    isHost: true
   },
   [PlayerId.BOT_1]: {
     id: PlayerId.BOT_1,
@@ -17,7 +18,8 @@ export const INITIAL_PLAYERS: Record<PlayerId, Player> = {
     color: '#2563eb', // Blue
     score: 0,
     avatar: 'https://picsum.photos/seed/commander/100/100',
-    level: 1
+    level: 1,
+    isHost: false
   },
   [PlayerId.BOT_2]: {
     id: PlayerId.BOT_2,
@@ -25,7 +27,8 @@ export const INITIAL_PLAYERS: Record<PlayerId, Player> = {
     color: '#16a34a', // Green
     score: 0,
     avatar: 'https://picsum.photos/seed/sage/100/100',
-    level: 1
+    level: 1,
+    isHost: false
   }
 };
 
