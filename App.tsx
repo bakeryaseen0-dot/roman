@@ -8,6 +8,7 @@ import Logo from './components/Logo';
 import { PlayerId, GameState, TriviaQuestion, Territory, ChatMessage, Player, GamePhase, PeerMessage, UserAccount } from './types';
 import { WORLD_TERRITORIES, CATEGORIES } from './constants';
 import { fetchTriviaQuestion, generateChatReaction } from './services/geminiService';
+import { UserDataServer } from './services/db';
 import { Peer, DataConnection } from 'peerjs';
 
 const PLAYER_COLORS = ['#dc2626', '#2563eb', '#16a34a', '#d97706', '#7c3aed'];
@@ -16,6 +17,7 @@ const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
   const [myId, setMyId] = useState<string>('');
   const [roomCodeInput, setRoomCodeInput] = useState<string>('');
+  const [isLoadingSession, setIsLoadingSession] = useState(true);
   
   const [gameState, setGameState] = useState<GameState>({
     players: [],
@@ -35,11 +37,20 @@ const App: React.FC = () => {
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const saved = localStorage.getItem('sword_knowledge_current');
-    if (saved) {
-      setCurrentUser(JSON.parse(saved));
-      setGameState(prev => ({ ...prev, phase: 'LOBBY' }));
-    }
+    const initSession = async () => {
+      try {
+        const session = await UserDataServer.getSession();
+        if (session) {
+          setCurrentUser(session);
+          setGameState(prev => ({ ...prev, phase: 'LOBBY' }));
+        }
+      } catch (err) {
+        console.error("Session load error", err);
+      } finally {
+        setIsLoadingSession(false);
+      }
+    };
+    initSession();
   }, []);
 
   const handleLogin = (user: UserAccount) => {
@@ -47,29 +58,50 @@ const App: React.FC = () => {
     setGameState(prev => ({ ...prev, phase: 'LOBBY' }));
   };
 
+  const handleLogout = async () => {
+    await UserDataServer.logout();
+    setCurrentUser(null);
+    setGameState(prev => ({ ...prev, phase: 'AUTH' }));
+    if (peerRef.current) peerRef.current.destroy();
+  };
+
   const isHost = gameState.players.find(p => p.id === myId)?.isHost ?? false;
   const currentPlayer = gameState.players[gameState.currentPlayerIndex];
   const isMyTurn = currentPlayer?.id === myId;
+  const isBotTurn = currentPlayer?.id.startsWith('bot-');
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [gameState.chat]);
 
   useEffect(() => {
-    if (gameState.phase === 'AUTH') return;
+    if (gameState.phase === 'AUTH' || !currentUser) return;
     const peer = new Peer();
     peerRef.current = peer;
     peer.on('open', (id) => setMyId(id));
     peer.on('connection', (conn) => {
-      if (!isHost && gameState.phase !== 'LOBBY') {
+      if (!isHost && gameState.phase !== 'LOBBY' && gameState.phase !== 'ROOM_WAITING') {
         conn.close();
         return;
       }
-      conn.on('open', () => connectionsRef.current.push(conn));
+      conn.on('open', () => {
+        connectionsRef.current.push(conn);
+        // If we are host, broadcast current players to the new guy
+        if (isHost) {
+          // This is handled by standard state updates
+        }
+      });
       conn.on('data', (data: any) => handleIncomingData(data as PeerMessage, conn));
     });
     return () => peer.destroy();
-  }, [isHost, gameState.phase]);
+  }, [isHost, gameState.phase, !!currentUser]);
+
+  // Sync state whenever it changes locally (for host)
+  useEffect(() => {
+    if (isHost) {
+      broadcast({ type: 'STATE_UPDATE', state: gameState });
+    }
+  }, [gameState.phase, gameState.currentPlayerIndex, gameState.territories, gameState.players]);
 
   const broadcast = (message: PeerMessage) => {
     connectionsRef.current.forEach(conn => {
@@ -84,6 +116,7 @@ const App: React.FC = () => {
         break;
       case 'CHAT':
         setGameState(prev => ({ ...prev, chat: [...prev.chat, data.message].slice(-30) }));
+        if (isHost) broadcast(data); // Relay chat to everyone
         break;
       case 'QUESTION_TRIGGER':
         setActiveQuestion(data.question);
@@ -121,22 +154,137 @@ const App: React.FC = () => {
     if (conn) {
       conn.on('open', () => {
         connectionsRef.current.push(conn);
+        const me: Player = {
+          id: myId,
+          name: currentUser.username,
+          color: PLAYER_COLORS[1], // Rough guess, host will sync correct state
+          score: 0,
+          avatar: currentUser.avatar,
+          level: currentUser.level,
+          isHost: false
+        };
+        // We don't update local state here, we wait for the Host to send STATE_UPDATE
+        // But we need to tell host we joined. Actually PeerJS 'connection' handles this.
+        // Let's explicitly tell host we are a player
+        conn.send({ 
+          type: 'CHAT', 
+          message: { id: Date.now().toString(), sender: 'نظام', text: `${currentUser.username} انضم للمعركة!`, type: 'system', timestamp: new Date() } 
+        });
       });
       conn.on('data', (data) => handleIncomingData(data as PeerMessage));
       setGameState(prev => ({ ...prev, phase: 'ROOM_WAITING', roomCode: roomCodeInput }));
     }
   };
 
+  // Bot Turn Effect - Only runs on Host
+  useEffect(() => {
+    if (!isHost || gameState.phase === 'LOBBY' || gameState.phase === 'ROOM_WAITING' || gameState.phase === 'GAME_OVER') return;
+    
+    const currentPlayer = gameState.players[gameState.currentPlayerIndex];
+    if (currentPlayer && currentPlayer.id.startsWith('bot-')) {
+      const handleBotSequence = async () => {
+        // 1. Thinking phase (pick territory)
+        await new Promise(r => setTimeout(r, 2500));
+        
+        const availableTerritories = gameState.territories.filter(t => !t.ownerId);
+        if (availableTerritories.length === 0) return; // Should transition phase
+
+        const target = availableTerritories[Math.floor(Math.random() * availableTerritories.length)];
+        
+        // 2. Select territory
+        setGameState(prev => ({ ...prev, selectedTerritoryId: target.id }));
+        const category = CATEGORIES[Math.floor(Math.random() * CATEGORIES.length)];
+        const question = await fetchTriviaQuestion(category);
+        
+        setActiveQuestion(question);
+        setTimer(20);
+        broadcast({ type: 'QUESTION_TRIGGER', question });
+
+        // 3. "Answering" phase
+        await new Promise(r => setTimeout(r, 4000));
+        
+        // Bots have a 75% success rate
+        const isCorrect = Math.random() < 0.75;
+        
+        // 4. Resolve turn
+        resolveTurn(target.id, isCorrect, currentPlayer.id);
+      };
+
+      handleBotSequence();
+    }
+  }, [gameState.currentPlayerIndex, gameState.phase, isHost]);
+
+  const resolveTurn = (territoryId: string, correct: boolean, playerId: string) => {
+    setGameState(prev => {
+      let newState = { ...prev, selectedTerritoryId: null };
+      const territory = prev.territories.find(t => t.id === territoryId);
+      
+      if (correct && territory) {
+        newState.territories = prev.territories.map(t => t.id === territoryId ? { ...t, ownerId: playerId } : t);
+        newState.players = prev.players.map(p => p.id === playerId ? { ...p, score: p.score + territory.points } : p);
+        
+        // Add chat reaction
+        const reactionMsg: ChatMessage = {
+          id: Math.random().toString(),
+          sender: 'المعلق',
+          text: `${prev.players.find(p => p.id === playerId)?.name} يسيطر على ${territory.name}!`,
+          type: 'bot',
+          timestamp: new Date()
+        };
+        newState.chat = [...prev.chat, reactionMsg].slice(-30);
+      }
+
+      newState.currentPlayerIndex = (prev.currentPlayerIndex + 1) % prev.players.length;
+      const isAllOwned = newState.territories.every(t => t.ownerId !== null);
+      newState.phase = isAllOwned ? 'BATTLE' : 'INITIAL_LANDING';
+      
+      return newState;
+    });
+    setActiveQuestion(null);
+  };
+
   const startGame = () => {
     if (!isHost) return;
-    const newState: GameState = { ...gameState, phase: 'INITIAL_LANDING' };
+    
+    let finalPlayers = [...gameState.players];
+    
+    // Add Bots if less than 3 players
+    if (finalPlayers.length < 2) {
+      finalPlayers.push({
+        id: 'bot-1',
+        name: 'القائد خالد (آلي)',
+        color: PLAYER_COLORS[1],
+        score: 0,
+        avatar: 'https://picsum.photos/seed/commander/100/100',
+        level: 10,
+        isHost: false
+      });
+    }
+    if (finalPlayers.length < 3) {
+      finalPlayers.push({
+        id: 'bot-2',
+        name: 'الداهية عثمان (آلي)',
+        color: PLAYER_COLORS[2],
+        score: 0,
+        avatar: 'https://picsum.photos/seed/sage/100/100',
+        level: 15,
+        isHost: false
+      });
+    }
+
+    const newState: GameState = { 
+      ...gameState, 
+      players: finalPlayers,
+      phase: 'INITIAL_LANDING' 
+    };
+    
     setGameState(newState);
     broadcast({ type: 'START_GAME' });
     broadcast({ type: 'STATE_UPDATE', state: newState });
   };
 
   const handleTerritoryClick = async (territoryId: string) => {
-    if (!isMyTurn || gameState.phase === 'ROOM_WAITING' || gameState.phase === 'GAME_OVER') return;
+    if (!isMyTurn || isBotTurn || gameState.phase === 'ROOM_WAITING' || gameState.phase === 'GAME_OVER') return;
     const territory = gameState.territories.find(t => t.id === territoryId);
     if (!territory || (gameState.phase === 'INITIAL_LANDING' && territory.ownerId)) return;
 
@@ -148,25 +296,9 @@ const App: React.FC = () => {
     broadcast({ type: 'QUESTION_TRIGGER', question });
   };
 
-  const handleAnswer = async (correct: boolean) => {
-    if (!isMyTurn) return;
-    const territoryId = gameState.selectedTerritoryId;
-    if (!territoryId) return;
-
-    setGameState(prev => {
-      let newState = { ...prev, selectedTerritoryId: null };
-      const territory = prev.territories.find(t => t.id === territoryId);
-      if (correct && territory) {
-        newState.territories = prev.territories.map(t => t.id === territoryId ? { ...t, ownerId: myId } : t);
-        newState.players = prev.players.map(p => p.id === myId ? { ...p, score: p.score + territory.points } : p);
-      }
-      newState.currentPlayerIndex = (prev.currentPlayerIndex + 1) % prev.players.length;
-      const isAllOwned = newState.territories.every(t => t.ownerId !== null);
-      newState.phase = isAllOwned ? 'BATTLE' : 'INITIAL_LANDING';
-      broadcast({ type: 'STATE_UPDATE', state: newState });
-      return newState;
-    });
-    setActiveQuestion(null);
+  const handleAnswer = (correct: boolean) => {
+    if (!isMyTurn || !gameState.selectedTerritoryId) return;
+    resolveTurn(gameState.selectedTerritoryId, correct, myId);
   };
 
   const sendChatMessage = (text: string) => {
@@ -179,14 +311,20 @@ const App: React.FC = () => {
       timestamp: new Date()
     };
     setGameState(prev => ({ ...prev, chat: [...prev.chat, msg].slice(-30) }));
-    broadcast({ type: 'CHAT', message: msg });
+    if (isHost) broadcast({ type: 'CHAT', message: msg });
+    else connectionsRef.current[0]?.send({ type: 'CHAT', message: msg });
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('sword_knowledge_current');
-    setCurrentUser(null);
-    setGameState(prev => ({ ...prev, phase: 'AUTH' }));
-  };
+  if (isLoadingSession) {
+    return (
+      <div className="h-screen w-screen flex flex-col items-center justify-center bg-[#0f0a05] parchment">
+         <div className="animate-pulse flex flex-col items-center">
+            <Logo size="md" />
+            <p className="mt-4 text-yellow-600 font-bold arabic-font animate-bounce">جارٍ استدعاء بيانات المحارب...</p>
+         </div>
+      </div>
+    );
+  }
 
   return (
     <div className="h-screen w-screen flex flex-col bg-[#0f0a05] overflow-hidden text-white">
@@ -195,57 +333,26 @@ const App: React.FC = () => {
       ) : gameState.phase === 'LOBBY' ? (
         <div className="flex-1 flex flex-col items-center justify-center parchment relative overflow-hidden">
            <div className="absolute top-0 left-0 w-full h-full bg-black/40"></div>
-           
            <div className="z-10 bg-[#2d1a01] p-10 rounded-3xl border-8 border-[#8b4513] shadow-[0_0_80px_rgba(0,0,0,1)] text-center max-w-lg w-full mx-4 relative overflow-hidden">
-              {/* Background Glow Overlay */}
-              <div className="absolute -top-24 -left-24 w-48 h-48 bg-yellow-500/10 blur-[100px]"></div>
-
               <div className="absolute top-4 right-4">
-                 <button onClick={handleLogout} className="text-[10px] text-red-500 hover:text-red-400 font-bold uppercase tracking-tighter transition-colors">تسجيل الخروج</button>
+                 <button onClick={handleLogout} className="text-[10px] text-red-500 hover:text-red-400 font-bold uppercase tracking-tighter">تسجيل الخروج</button>
               </div>
-
-              <div className="mb-8">
-                <Logo size="lg" />
-              </div>
-
-              <div className="mb-8 flex items-center justify-center gap-4 bg-[#1a0f00] p-4 rounded-3xl border border-yellow-700/50 shadow-inner">
+              <div className="mb-8"><Logo size="lg" /></div>
+              <div className="mb-8 flex items-center justify-center gap-4 bg-[#1a0f00] p-4 rounded-3xl border border-yellow-700/50 shadow-inner group">
                   <div className="relative">
-                    <img src={currentUser?.avatar} className="w-16 h-16 rounded-full border-2 border-yellow-500 shadow-lg" alt="avatar" />
-                    <div className="absolute -bottom-1 -right-1 bg-yellow-600 text-[10px] px-1.5 py-0.5 rounded-full font-bold border border-yellow-200">
-                      LVL {currentUser?.level}
-                    </div>
+                    <img src={currentUser?.avatar} className="w-16 h-16 rounded-full border-2 border-yellow-500" alt="avatar" />
+                    <div className="absolute -bottom-1 -right-1 bg-yellow-600 text-[10px] px-1.5 py-0.5 rounded-full font-bold">LVL {currentUser?.level}</div>
                   </div>
                   <div className="text-right">
                     <p className="font-bold text-yellow-400 text-xl arabic-font">{currentUser?.username}</p>
-                    <div className="flex items-center gap-2 text-[10px] text-gray-400 font-bold uppercase tracking-widest">
-                       <i className="fa-solid fa-trophy text-yellow-600"></i>
-                       {currentUser?.wins} انتصارات
-                    </div>
+                    <div className="text-[10px] text-gray-400">{currentUser?.wins} انتصارات</div>
                   </div>
               </div>
-
               <div className="grid grid-cols-1 gap-4">
-                <button 
-                  onClick={createRoom}
-                  className="w-full bg-gradient-to-b from-yellow-500 to-yellow-700 hover:from-yellow-400 hover:to-yellow-600 py-5 rounded-2xl text-2xl font-bold arabic-font border-b-8 border-yellow-900 shadow-xl transition-all active:scale-95 active:border-b-0"
-                >
-                  تحدي عالمي جديد
-                </button>
+                <button onClick={createRoom} className="w-full bg-gradient-to-b from-yellow-500 to-yellow-700 hover:from-yellow-400 py-5 rounded-2xl text-2xl font-bold arabic-font border-b-8 border-yellow-900 shadow-xl transition-all active:scale-95">إنشاء غرفة جديدة</button>
                 <div className="flex gap-2">
-                  <div className="flex-1 relative">
-                    <input 
-                      placeholder="أدخل كود الغرفة" 
-                      className="w-full h-full bg-[#1a0f00] border-2 border-[#8b4513] rounded-xl px-4 text-center text-yellow-400 font-bold focus:ring-2 focus:ring-yellow-600 outline-none"
-                      value={roomCodeInput}
-                      onChange={(e) => setRoomCodeInput(e.target.value)}
-                    />
-                  </div>
-                  <button 
-                    onClick={joinRoom}
-                    className="bg-gradient-to-b from-blue-600 to-blue-800 hover:from-blue-500 hover:to-blue-700 px-8 py-5 rounded-xl font-bold border-b-4 border-blue-950 shadow-lg transition-all active:scale-95 active:border-b-0"
-                  >
-                    انضمام
-                  </button>
+                  <input placeholder="أدخل كود الغرفة" className="w-full bg-[#1a0f00] border-2 border-[#8b4513] rounded-xl px-4 text-center text-yellow-400 font-bold" value={roomCodeInput} onChange={(e) => setRoomCodeInput(e.target.value)} />
+                  <button onClick={joinRoom} className="bg-blue-600 px-8 py-5 rounded-xl font-bold border-b-4 border-blue-950 shadow-lg">انضمام</button>
                 </div>
               </div>
            </div>
@@ -253,44 +360,27 @@ const App: React.FC = () => {
       ) : gameState.phase === 'ROOM_WAITING' ? (
         <div className="flex-1 flex flex-col items-center justify-center bg-[#1a0f00] parchment relative">
            <div className="z-10 bg-[#2d1a01] p-10 rounded-3xl border-8 border-[#8b4513] shadow-2xl text-center max-w-xl w-full">
-              <div className="mb-6">
-                <Logo size="sm" />
-              </div>
+              <Logo size="sm" />
               <h2 className="text-3xl font-bold text-yellow-500 mb-4 arabic-font">غرفة انتظار المحاربين</h2>
               <div className="bg-[#1a0f00] p-6 rounded-2xl border-2 border-dashed border-yellow-600 mb-8 relative">
                  <p className="text-xs text-yellow-600/70 font-bold uppercase mb-2">شارك هذا الكود مع الحلفاء:</p>
-                 <span className="text-5xl font-black text-white tracking-[0.2em] drop-shadow-[0_0_10px_rgba(255,255,255,0.3)]">{myId.substring(0, 6).toUpperCase()}</span>
-                 <div className="absolute -top-3 -right-3 bg-red-600 text-white text-[10px] px-2 py-1 rounded-full font-bold animate-pulse">مباشر</div>
+                 <span className="text-5xl font-black text-white tracking-[0.2em]">{myId.substring(0, 6).toUpperCase()}</span>
+                 {gameState.players.length < 3 && <div className="mt-4 text-xs text-gray-500 font-bold italic animate-pulse">سيتم إضافة محاربي الذكاء الاصطناعي تلقائياً عند البدء...</div>}
               </div>
               <div className="space-y-4 mb-8">
-                <h3 className="text-[10px] font-black text-gray-500 uppercase tracking-widest text-right">المحاربون المنضمون ({gameState.players.length})</h3>
                 <div className="flex flex-wrap justify-center gap-6">
                   {gameState.players.map(p => (
-                    <div key={p.id} className="flex flex-col items-center gap-2 group">
-                       <div className="relative">
-                         <img src={p.avatar} className="w-20 h-20 rounded-full border-4 border-yellow-600 shadow-lg transition-transform group-hover:scale-110" alt={p.name} />
-                         {p.isHost && <i className="fa-solid fa-crown absolute -top-2 -right-2 text-yellow-400 drop-shadow-lg"></i>}
-                       </div>
-                       <span className={`text-sm font-bold ${p.id === myId ? 'text-yellow-400' : 'text-gray-300'}`}>
-                         {p.name} {p.id === myId ? '(أنت)' : ''}
-                       </span>
+                    <div key={p.id} className="flex flex-col items-center gap-2">
+                       <img src={p.avatar} className="w-20 h-20 rounded-full border-4 border-yellow-600 shadow-lg" alt={p.name} />
+                       <span className={`text-sm font-bold ${p.id === myId ? 'text-yellow-400' : 'text-gray-300'}`}>{p.name}</span>
                     </div>
                   ))}
                 </div>
               </div>
               {isHost ? (
-                <button 
-                  disabled={gameState.players.length < 1}
-                  onClick={startGame}
-                  className="w-full bg-gradient-to-b from-green-600 to-green-800 hover:from-green-500 hover:to-green-700 py-5 rounded-2xl text-2xl font-bold arabic-font border-b-8 border-green-950 shadow-xl transition-all active:scale-95 active:border-b-0 disabled:opacity-50"
-                >
-                  بدء الزحف المقدس
-                </button>
+                <button onClick={startGame} className="w-full bg-green-600 py-5 rounded-2xl text-2xl font-bold arabic-font border-b-8 border-green-950 shadow-xl transition-all active:scale-95">بدء الزحف المقدس</button>
               ) : (
-                <div className="flex items-center justify-center gap-3 text-yellow-500 animate-pulse bg-yellow-900/20 py-4 rounded-xl border border-yellow-900/50">
-                  <i className="fa-solid fa-hourglass-half"></i>
-                  <p className="font-bold">في انتظار القائد لإصدار أوامر الحرب...</p>
-                </div>
+                <p className="text-yellow-500 animate-pulse bg-yellow-900/20 py-4 rounded-xl border border-yellow-900/50 font-bold">في انتظار القائد لإصدار أوامر الحرب...</p>
               )}
            </div>
         </div>
@@ -299,51 +389,38 @@ const App: React.FC = () => {
           <div className="flex-1 flex flex-col border-l-4 border-[#3d2b1f]">
             <Header players={gameState.players.reduce((acc, p) => ({...acc, [p.id]: p}), {})} currentPlayerId={currentPlayer?.id} phase={gameState.phase} />
             <div className="flex-1 relative bg-[#0a0500]">
-              <GameMap 
-                territories={gameState.territories} 
-                players={gameState.players.reduce((acc, p) => ({...acc, [p.id]: p}), {})}
-                onTerritoryClick={handleTerritoryClick}
-                selectedTerritoryId={gameState.selectedTerritoryId}
-                phase={gameState.phase}
-              />
-              {!isMyTurn && (
+              <GameMap territories={gameState.territories} players={gameState.players.reduce((acc, p) => ({...acc, [p.id]: p}), {})} onTerritoryClick={handleTerritoryClick} selectedTerritoryId={gameState.selectedTerritoryId} phase={gameState.phase} />
+              {(!isMyTurn && !isBotTurn) && (
                 <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-black/80 px-8 py-3 rounded-full border border-yellow-500/50 shadow-[0_0_20px_rgba(255,165,0,0.2)] animate-pulse z-30 flex items-center gap-3">
                   <i className="fa-solid fa-shield-halved text-yellow-500"></i>
                   <span className="font-bold tracking-wide">دور المحارب {currentPlayer?.name}...</span>
                 </div>
               )}
+              {isBotTurn && (
+                <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-blue-900/80 px-8 py-3 rounded-full border border-blue-400 shadow-[0_0_20px_rgba(0,0,255,0.3)] animate-pulse z-30 flex items-center gap-3">
+                  <i className="fa-solid fa-microchip text-blue-400"></i>
+                  <span className="font-bold tracking-wide">الذكاء الاصطناعي {currentPlayer?.name} يفكر...</span>
+                </div>
+              )}
             </div>
           </div>
-          {/* Chat Sidebar */}
           <div className="w-85 bg-[#1a0f00] flex flex-col shadow-2xl z-40 border-r-4 border-[#3d2b1f]">
             <div className="p-4 border-b border-[#3d2b1f] bg-[#2d1a01] flex justify-between items-center shadow-lg">
-               <h3 className="font-bold text-yellow-500 flex items-center gap-2">
-                 <i className="fa-solid fa-scroll"></i> وقائع المعركة
-               </h3>
-               <div className="flex items-center gap-1">
-                 <div className="w-2 h-2 bg-green-500 rounded-full animate-ping"></div>
-                 <span className="text-[10px] text-green-500 font-black uppercase">LIVE</span>
-               </div>
+               <h3 className="font-bold text-yellow-500 flex items-center gap-2"><i className="fa-solid fa-scroll"></i> وقائع المعركة</h3>
             </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-[url('https://www.transparenttextures.com/patterns/dark-leather.png')]">
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
                {gameState.chat.map(msg => (
-                 <div key={msg.id} className={`p-3 rounded-lg ${msg.type === 'system' ? 'bg-yellow-900/20 border border-yellow-900/50 italic text-center text-xs text-yellow-600/70' : 'bg-[#2d1a01] border-r-4 border-yellow-600 shadow-sm'}`}>
-                    {msg.type !== 'system' && (
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="font-black text-[10px] text-yellow-600 uppercase">{msg.sender}</span>
-                      </div>
-                    )}
+                 <div key={msg.id} className={`p-3 rounded-lg ${msg.type === 'system' ? 'bg-yellow-900/10 italic text-center text-xs text-yellow-600/70' : msg.type === 'bot' ? 'bg-blue-900/10 border-r-4 border-blue-500' : 'bg-[#2d1a01] border-r-4 border-yellow-600 shadow-sm'}`}>
+                    {msg.type !== 'system' && <span className="font-black text-[10px] text-yellow-600 uppercase block">{msg.sender}</span>}
                     <p className="text-gray-300 text-sm leading-relaxed">{msg.text}</p>
                  </div>
                ))}
                <div ref={chatEndRef} />
             </div>
             <form onSubmit={(e) => { e.preventDefault(); const input = e.currentTarget.querySelector('input'); if(input) { sendChatMessage(input.value); input.value = ''; } }} className="p-4 border-t border-[#3d2b1f] bg-[#0a0500]">
-               <div className="flex items-center gap-2 bg-[#1a0f00] p-2 rounded-2xl border border-[#3d2b1f] focus-within:border-yellow-600 transition-colors shadow-inner">
-                  <input placeholder="أرسل رسالة إلى رفاقك..." className="bg-transparent border-none outline-none text-sm w-full py-2 px-2 text-yellow-100 placeholder:text-gray-600" />
-                  <button type="submit" className="bg-yellow-600 text-[#1a0f00] w-10 h-10 rounded-xl hover:bg-yellow-500 transition-all active:scale-90 flex items-center justify-center">
-                    <i className="fa-solid fa-paper-plane-top"></i>
-                  </button>
+               <div className="flex items-center gap-2 bg-[#1a0f00] p-2 rounded-2xl border border-[#3d2b1f]">
+                  <input placeholder="أرسل رسالة..." className="bg-transparent border-none outline-none text-sm w-full py-2 px-2 text-yellow-100" />
+                  <button type="submit" className="bg-yellow-600 text-[#1a0f00] w-10 h-10 rounded-xl"><i className="fa-solid fa-paper-plane"></i></button>
                </div>
             </form>
           </div>
